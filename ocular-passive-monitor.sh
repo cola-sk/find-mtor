@@ -70,14 +70,25 @@ check_fs_usage_health() {
   (( FS_USAGE_ENABLED )) || return
   (( FS_USAGE_RESTARTING )) && return
 
-  local source_pid filter_pid
+  local source_pid filter_pid worker_pid
   source_pid="$(cat "$OUT_DIR/fs-usage-source.pid" 2>/dev/null || true)"
   filter_pid="$(cat "$OUT_DIR/fs-usage-filter.pid" 2>/dev/null || true)"
+  worker_pid="$(cat "$OUT_DIR/fs-usage-worker.pid" 2>/dev/null || true)"
 
   if [[ -z "$source_pid" ]] || ! kill -0 "$source_pid" 2>/dev/null; then
     log_health "fs_usage source exited; restarting"
     {
       echo "== $(date '+%F %T %Z %z') fs_usage source exited; restarting =="
+      [[ -s "$OUT_DIR/fs-usage.err" ]] && tail -n 10 "$OUT_DIR/fs-usage.err"
+    } >> "$OUT_DIR/fs-usage.log"
+    restart_fs_usage
+    return
+  fi
+
+  if [[ -n "$worker_pid" ]] && ! ps -p "$worker_pid" >/dev/null 2>&1; then
+    log_health "fs_usage worker exited; restarting"
+    {
+      echo "== $(date '+%F %T %Z %z') fs_usage worker exited; restarting =="
       [[ -s "$OUT_DIR/fs-usage.err" ]] && tail -n 10 "$OUT_DIR/fs-usage.err"
     } >> "$OUT_DIR/fs-usage.log"
     restart_fs_usage
