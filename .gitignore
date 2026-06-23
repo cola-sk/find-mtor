@@ -1,0 +1,5 @@
+# 采集输出目录（含日志和 pid 文件）
+logs/
+
+# macOS 系统文件
+.DS_Store
