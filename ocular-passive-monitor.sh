@@ -11,8 +11,11 @@ echo "Logs: $OUT_DIR"
 echo "Stop with Ctrl-C"
 echo
 
-targets='OCular|LAgent|LAgentUser|LMonitor|LMonitor2|LInject|LSensitive|LSDHelper|LVnctransfer|LWMHelper'
+targets='OCular|LAgent|LAgentUser|LMonitor|LMonitor2|LInject|LSensitive|LSDHelper|LVnctransfer|LWMHelper|LSDConfig|LNacConfig'
 screen_terms='ScreenShot|screenshot|Snapshot|SCREEN_CAPTURE|CGDisplay|CGWindow|SCStream|ScreenCapture|GetScreenshot|CaptureCtrl|ScreenShotCtrl|TCC|kTCCServiceScreenCapture'
+FS_USAGE_ENABLED=0
+FS_USAGE_RESTARTING=0
+FS_FIFO="$OUT_DIR/fs-usage.pipe"
 
 # Prefer ripgrep, fall back to grep -E so the script still works without rg.
 if command -v rg >/dev/null 2>&1; then
@@ -30,6 +33,22 @@ filter_i() {
   fi
 }
 
+log_health() {
+  echo "[$(date '+%F %T %Z %z')] $*" >> "$OUT_DIR/health.log"
+}
+
+ensure_sudo() {
+  if sudo -n -v 2>/dev/null; then
+    return
+  fi
+
+  echo "sudo credentials required for system TCC and fs_usage."
+  if ! sudo -v; then
+    echo "ERROR: sudo authentication failed; cannot start reliable monitoring." >&2
+    exit 1
+  fi
+}
+
 # Reading TCC.db requires Full Disk Access for the terminal app; warn early.
 if ! sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" 'select 1 limit 1;' >/dev/null 2>&1; then
   echo "WARNING: cannot read user TCC.db (grant Full Disk Access to your terminal for TCC checks)."
@@ -42,9 +61,34 @@ write_tcc_snapshot() {
       "select * from access where service like '%Screen%' or client like '%OCular%' or client like '%tec%';" 2>&1
     echo
     echo "== $(date '+%F %T %Z %z') system TCC screen-capture entries, may require sudo =="
-    sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+    sudo -n sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
       "select * from access where service like '%Screen%' or client like '%OCular%' or client like '%tec%';" 2>&1
   } >> "$OUT_DIR/tcc-snapshot.log"
+}
+
+check_fs_usage_health() {
+  (( FS_USAGE_ENABLED )) || return
+  (( FS_USAGE_RESTARTING )) && return
+
+  local source_pid filter_pid
+  source_pid="$(cat "$OUT_DIR/fs-usage-source.pid" 2>/dev/null || true)"
+  filter_pid="$(cat "$OUT_DIR/fs-usage-filter.pid" 2>/dev/null || true)"
+
+  if [[ -z "$source_pid" ]] || ! kill -0 "$source_pid" 2>/dev/null; then
+    log_health "fs_usage source exited; restarting"
+    {
+      echo "== $(date '+%F %T %Z %z') fs_usage source exited; restarting =="
+      [[ -s "$OUT_DIR/fs-usage.err" ]] && tail -n 10 "$OUT_DIR/fs-usage.err"
+    } >> "$OUT_DIR/fs-usage.log"
+    restart_fs_usage
+    return
+  fi
+
+  if [[ -z "$filter_pid" ]] || ! kill -0 "$filter_pid" 2>/dev/null; then
+    log_health "fs_usage filter exited; restarting"
+    echo "== $(date '+%F %T %Z %z') fs_usage filter exited; restarting ==" >> "$OUT_DIR/fs-usage.log"
+    restart_fs_usage
+  fi
 }
 
 snapshot_loop() {
@@ -85,6 +129,7 @@ snapshot_loop() {
       } >> "$OUT_DIR/network.log"
     fi
 
+    check_fs_usage_health
     sleep 5
   done
 }
@@ -107,9 +152,53 @@ start_fs_usage() {
   echo "Starting fs_usage (needs sudo)..."
   # Filter to OCular processes, the .OCular tree, and screenshot markers only.
   # (Matching bare .png/.jpg flooded the log with unrelated system activity.)
-  sudo fs_usage -w -f filesys 2>/dev/null | filter_i "$targets|/\.OCular/|ScreenShot|kTCCServiceScreenCapture" \
-    >> "$OUT_DIR/fs-usage.log" 2>&1 &
-  echo $! > "$OUT_DIR/fs-usage.pid"
+  rm -f "$FS_FIFO"
+  rm -f "$OUT_DIR/fs-usage-source.pid" "$OUT_DIR/fs-usage-filter.pid" "$OUT_DIR/fs-usage-worker.pid"
+  mkfifo "$FS_FIFO"
+
+  filter_i "$targets|/\.OCular/|ScreenShot|kTCCServiceScreenCapture" \
+    < "$FS_FIFO" >> "$OUT_DIR/fs-usage.log" 2>&1 &
+  echo $! > "$OUT_DIR/fs-usage-filter.pid"
+
+  sudo -n -S fs_usage -w -f filesys > "$FS_FIFO" 2>> "$OUT_DIR/fs-usage.err" < /dev/null &
+  echo $! > "$OUT_DIR/fs-usage-source.pid"
+
+  sleep 1
+  if ! kill -0 "$(cat "$OUT_DIR/fs-usage-source.pid")" 2>/dev/null; then
+    echo "ERROR: fs_usage failed to start; see $OUT_DIR/fs-usage.err" >&2
+    log_health "fs_usage failed to start"
+    exit 1
+  fi
+
+  local worker_pid
+  worker_pid="$(pgrep -P "$(cat "$OUT_DIR/fs-usage-source.pid")" -x fs_usage 2>/dev/null | head -n 1 || true)"
+  [[ -n "$worker_pid" ]] && echo "$worker_pid" > "$OUT_DIR/fs-usage-worker.pid"
+  FS_USAGE_ENABLED=1
+  log_health "fs_usage started"
+}
+
+stop_fs_usage() {
+  FS_USAGE_ENABLED=0
+  local pid_file pid
+  for pid_file in "$OUT_DIR/fs-usage-worker.pid" "$OUT_DIR/fs-usage-source.pid" "$OUT_DIR/fs-usage-filter.pid"; do
+    [[ -f "$pid_file" ]] || continue
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || sudo -n kill "$pid" 2>/dev/null || true
+  done
+  rm -f "$FS_FIFO"
+}
+
+restart_fs_usage() {
+  FS_USAGE_RESTARTING=1
+  stop_fs_usage
+  if sudo -n -v 2>/dev/null; then
+    start_fs_usage
+  else
+    log_health "cannot restart fs_usage: sudo credentials unavailable"
+    echo "== $(date '+%F %T %Z %z') cannot restart fs_usage: sudo credentials unavailable ==" >> "$OUT_DIR/fs-usage.log"
+  fi
+  FS_USAGE_RESTARTING=0
 }
 
 cleanup() {
@@ -123,17 +212,28 @@ cleanup() {
   echo
   echo "Stopping monitor..."
   [[ -f "$OUT_DIR/log-stream.pid" ]] && kill "$(cat "$OUT_DIR/log-stream.pid")" 2>/dev/null || true
-  # fs_usage runs as root behind sudo; the recorded pid is the local filter, so kill
-  # the privileged fs_usage process directly by name to avoid leaving a root process.
-  [[ -f "$OUT_DIR/fs-usage.pid" ]] && kill "$(cat "$OUT_DIR/fs-usage.pid")" 2>/dev/null || true
-  sudo pkill -f 'fs_usage -w -f filesys' 2>/dev/null || true
+  stop_fs_usage
+  [[ -f "$OUT_DIR/sudo-keepalive.pid" ]] && kill "$(cat "$OUT_DIR/sudo-keepalive.pid")" 2>/dev/null || true
   echo "Duration: ${hours}h ${minutes}min"
   echo "Saved logs in: $OUT_DIR"
   exit 0
 }
 trap cleanup INT TERM EXIT
 
+start_sudo_keepalive() {
+  # Background loop to refresh sudo credentials every 60 seconds.
+  (
+    while true; do
+      sudo -n -S -v < /dev/null 2>/dev/null || log_health "sudo credential refresh failed"
+      sleep 60
+    done
+  ) &
+  echo $! > "$OUT_DIR/sudo-keepalive.pid"
+}
+
+ensure_sudo
 write_tcc_snapshot
+start_sudo_keepalive
 start_log_stream
 start_fs_usage
 snapshot_loop

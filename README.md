@@ -7,11 +7,11 @@ macOS 上用于 OCular 的被动监控与证据采集脚本。
 ## 快速开始
 
 ```sh
-# 先缓存 sudo 凭证，避免后台 fs_usage 启动失败或被挂起。
+# 1. 先缓存 sudo 凭证，避免后台 fs_usage 启动失败。
 sudo -v
 
-# 启动被动监控。
-~/find-mtor/ocular-passive-monitor.sh
+# 2. 启动被动监控（推荐使用 caffeinate 运行，防止 Mac 进入睡眠导致内核 kdebug 追踪会话失效而丢失 fs_usage 日志）。
+caffeinate ~/find-mtor/ocular-passive-monitor.sh
 ```
 
 监控启动后，脚本会在控制台输出当前设备本地时间、日志目录和停止方式。按 `Ctrl-C` 结束监控。

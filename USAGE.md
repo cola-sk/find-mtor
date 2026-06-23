@@ -5,11 +5,11 @@
 ## 一、启动
 
 ```sh
-# 1. 先缓存 sudo 凭证（避免后台 fs_usage 被挂起）
+# 1. 先缓存 sudo 凭证（避免后台 fs_usage 启动失败）
 sudo -v
 
-# 2. 启动监控
-~/find-mtor/ocular-passive-monitor.sh
+# 2. 启动监控（推荐使用 caffeinate 运行，防止 Mac 进入睡眠导致内核 kdebug 追踪会话失效而丢失 fs_usage 日志）
+caffeinate ~/find-mtor/ocular-passive-monitor.sh
 ```
 
 脚本启动后会提示 `Password:` —— 输入你的开机密码，出现 `Starting fs_usage (needs sudo)...` 即代表全部采集组件已就绪。
