@@ -175,30 +175,56 @@ start_fs_usage() {
     echo "fs_usage disabled (OCULAR_MONITOR_NO_FS=1)."
     return
   fi
-  echo "Starting fs_usage (needs sudo)..."
-  # Filter to OCular processes, the .OCular tree, and screenshot markers only.
-  # (Matching bare .png/.jpg flooded the log with unrelated system activity.)
-  rm -f "$FS_FIFO"
-  rm -f "$OUT_DIR/fs-usage-source.pid" "$OUT_DIR/fs-usage-filter.pid" "$OUT_DIR/fs-usage-worker.pid"
-  mkfifo "$FS_FIFO"
 
-  filter_i "$targets|/\.OCular/|ScreenShot|kTCCServiceScreenCapture" \
-    < "$FS_FIFO" >> "$OUT_DIR/fs-usage.log" 2>&1 &
-  echo $! > "$OUT_DIR/fs-usage-filter.pid"
+  # We try to start fs_usage up to 3 times in case the kdebug session is temporarily busy (e.g. during a restart)
+  local attempt success
+  success=0
+  for attempt in 1 2 3; do
+    echo "Starting fs_usage (needs sudo)... (attempt $attempt)"
+    # Filter to OCular processes, the .OCular tree, and screenshot markers only.
+    rm -f "$FS_FIFO"
+    rm -f "$OUT_DIR/fs-usage-source.pid" "$OUT_DIR/fs-usage-filter.pid" "$OUT_DIR/fs-usage-worker.pid"
+    mkfifo "$FS_FIFO"
 
-  sudo -n -S fs_usage -w -f filesys > "$FS_FIFO" 2>> "$OUT_DIR/fs-usage.err" < /dev/null &
-  echo $! > "$OUT_DIR/fs-usage-source.pid"
+    filter_i "$targets|/\.OCular/|ScreenShot|kTCCServiceScreenCapture" \
+      < "$FS_FIFO" >> "$OUT_DIR/fs-usage.log" 2>&1 &
+    echo $! > "$OUT_DIR/fs-usage-filter.pid"
 
-  sleep 1
-  if ! kill -0 "$(cat "$OUT_DIR/fs-usage-source.pid")" 2>/dev/null; then
+    # Clear previous errors
+    : > "$OUT_DIR/fs-usage.err"
+
+    sudo -n -S fs_usage -w -f filesys > "$FS_FIFO" 2>> "$OUT_DIR/fs-usage.err" < /dev/null &
+    echo $! > "$OUT_DIR/fs-usage-source.pid"
+
+    sleep 1
+    if kill -0 "$(cat "$OUT_DIR/fs-usage-source.pid")" 2>/dev/null; then
+      local worker_pid
+      worker_pid="$(pgrep -P "$(cat "$OUT_DIR/fs-usage-source.pid")" -x fs_usage 2>/dev/null | head -n 1 || true)"
+      if [[ -n "$worker_pid" ]]; then
+        echo "$worker_pid" > "$OUT_DIR/fs-usage-worker.pid"
+        success=1
+        break
+      fi
+    fi
+
+    # Clean up the failed attempt's processes
+    local failed_source_pid failed_filter_pid
+    failed_source_pid="$(cat "$OUT_DIR/fs-usage-source.pid" 2>/dev/null || true)"
+    failed_filter_pid="$(cat "$OUT_DIR/fs-usage-filter.pid" 2>/dev/null || true)"
+    [[ -n "$failed_source_pid" ]] && ( kill "$failed_source_pid" 2>/dev/null || sudo -n kill "$failed_source_pid" 2>/dev/null || true )
+    [[ -n "$failed_filter_pid" ]] && ( kill "$failed_filter_pid" 2>/dev/null || true )
+    rm -f "$FS_FIFO"
+
+    echo "Warning: fs_usage failed to start (Resource busy?); retrying in 2 seconds..."
+    sleep 2
+  done
+
+  if (( success == 0 )); then
     echo "ERROR: fs_usage failed to start; see $OUT_DIR/fs-usage.err" >&2
     log_health "fs_usage failed to start"
     exit 1
   fi
 
-  local worker_pid
-  worker_pid="$(pgrep -P "$(cat "$OUT_DIR/fs-usage-source.pid")" -x fs_usage 2>/dev/null | head -n 1 || true)"
-  [[ -n "$worker_pid" ]] && echo "$worker_pid" > "$OUT_DIR/fs-usage-worker.pid"
   FS_USAGE_ENABLED=1
   log_health "fs_usage started"
 }
@@ -206,13 +232,31 @@ start_fs_usage() {
 stop_fs_usage() {
   FS_USAGE_ENABLED=0
   local pid_file pid
+  local pids_to_wait=()
   for pid_file in "$OUT_DIR/fs-usage-worker.pid" "$OUT_DIR/fs-usage-source.pid" "$OUT_DIR/fs-usage-filter.pid"; do
     [[ -f "$pid_file" ]] || continue
     pid="$(cat "$pid_file" 2>/dev/null || true)"
     [[ -n "$pid" ]] || continue
     kill "$pid" 2>/dev/null || sudo -n kill "$pid" 2>/dev/null || true
+    pids_to_wait+=("$pid")
   done
   rm -f "$FS_FIFO"
+
+  # Wait for the processes to actually exit
+  local pid_to_check alive count
+  for ((count=0; count<20; count++)); do
+    alive=0
+    for pid_to_check in "${pids_to_wait[@]}"; do
+      if ps -p "$pid_to_check" >/dev/null 2>&1; then
+        alive=1
+        break
+      fi
+    done
+    if (( alive == 0 )); then
+      break
+    fi
+    sleep 0.1
+  done
 }
 
 restart_fs_usage() {
