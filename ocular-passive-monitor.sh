@@ -99,6 +99,21 @@ check_fs_usage_health() {
     log_health "fs_usage filter exited; restarting"
     echo "== $(date '+%F %T %Z %z') fs_usage filter exited; restarting ==" >> "$OUT_DIR/fs-usage.log"
     restart_fs_usage
+    return
+  fi
+
+  # Check for silent log stoppage (kernel kdebug session takeover or trace interruption)
+  # If fs-usage.log has not been updated for 60 seconds, force a restart.
+  local last_mtime now diff
+  last_mtime="$(stat -f %m "$OUT_DIR/fs-usage.log" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  diff=$(( now - last_mtime ))
+  if (( diff > 60 )) && (( (now - START_EPOCH) > 60 )); then
+    log_health "fs_usage log inactive for $diff seconds (kdebug trace hijacked?); forcing restart"
+    {
+      echo "== $(date '+%F %T %Z %z') fs_usage log inactive ($diff s); forcing restart =="
+    } >> "$OUT_DIR/fs-usage.log"
+    restart_fs_usage
   fi
 }
 
